@@ -74,3 +74,14 @@ Lo script controlla questi tag DICOM in ordine e utilizza il primo valore non vu
 6. `ProtocolName (0018,1030)`
 7. `BodyPartExamined (0018,0015)`
 8. Nome della cartella genitore (fallback OsiriX)
+
+## AVVERTENZA
+
+### 1. Non Approvato Medicalmente
+Questo programma **non e approvato** da alcun ente medico, agenzia regolatoria o autorita sanitaria. **Non e** un programma medico certificato e **non deve** essere utilizzato per diagnosi cliniche, trattamenti o qualsiasi decisione medica. Utilizzalo solo per scopi informativi, educativi o di ricerca.
+
+### 2. Nessuna Responsabilita
+Bigm non si assume **alcuna responsabilita** per qualsiasi uso, uso improprio, danni, errori o conseguenze derivanti dall'uso di questo programma. Questo software e fornito **"cosi com'e"**, senza garanzie di alcun tipo, esplicite o implicite. Utilizzalo a tuo rischio.
+
+### 3. Credito Obbligatorio per la Ripubblicazione
+Se ripubblichi, condividi, ridistribuisci o sviluppi a partire da questo programma, **devi attribuire il giusto credito** a Bigm. La ripubblicazione **senza credito non e consentita**.
