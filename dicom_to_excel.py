@@ -16,13 +16,15 @@ Fixes applied after inspecting real DICOM files:
 Usage:
     python dicom_to_excel.py /path/to/OsiriX_folder
     python dicom_to_excel.py /path/to/OsiriX_folder --output MyArchive.xlsx
+    python dicom_to_excel.py /path/to/OsiriX_folder --year 2024
+    python dicom_to_excel.py /path/to/OsiriX_folder --year 2023,2024
     python dicom_to_excel.py /path/to/OsiriX_folder --debug   ← inspect tags
 
 Dependencies:
     pip install pydicom pandas openpyxl
 """
 
-import os, sys, re, argparse, struct
+import os, sys, re, argparse, time
 from pathlib import Path
 from collections import defaultdict
 from typing import Optional, Dict, List
@@ -45,6 +47,76 @@ XRAY_MODALITIES = {"DX", "CR", "RF", "XA", "MG", "DR", "PX", "IO", "OP", ""}
 # 1 dGy·cm² = 0.1 Gy × (0.01 m)² = 1e-5 Gy·m²
 DOSE_CONVERSION = 1e-5
 
+# English → Italian body-part translation for scanner descriptions
+_BODY_PART_IT = {
+    # Multi-word phrases (matched first, longest wins)
+    "CERVICAL SPINE":     "COLONNA CERVICALE",
+    "THORACIC SPINE":     "COLONNA DORSALE",
+    "LUMBAR SPINE":       "COLONNA LOMBARE",
+    "LUMBOSACRAL SPINE":  "COLONNA LOMBOSACRALE",
+    "WHOLE SPINE":        "COLONNA IN TOTO",
+    "FULL SPINE":         "COLONNA IN TOTO",
+    "C SPINE":            "COLONNA CERVICALE",
+    "T SPINE":            "COLONNA DORSALE",
+    "L SPINE":            "COLONNA LOMBARE",
+    "FACIAL BONES":       "OSSA FACCIALI",
+    "NASAL BONES":        "OSSA NASALI",
+    # Single words
+    "FOOT":       "PIEDE",
+    "FEET":       "PIEDI",
+    "HAND":       "MANO",
+    "HANDS":      "MANI",
+    "CHEST":      "TORACE",
+    "RIB":        "COSTOLA",
+    "RIBS":       "COSTOLE",
+    "SKULL":      "CRANIO",
+    "HEAD":       "CRANIO",
+    "KNEE":       "GINOCCHIO",
+    "HIP":        "ANCA",
+    "SHOULDER":   "SPALLA",
+    "ELBOW":      "GOMITO",
+    "WRIST":      "POLSO",
+    "ANKLE":      "CAVIGLIA",
+    "PELVIS":     "BACINO",
+    "ABDOMEN":    "ADDOME",
+    "FINGER":     "DITO",
+    "FINGERS":    "DITA",
+    "THUMB":      "POLLICE",
+    "TOE":        "DITO PIEDE",
+    "TOES":       "DITA PIEDE",
+    "FEMUR":      "FEMORE",
+    "TIBIA":      "TIBIA",
+    "FIBULA":     "PERONE",
+    "HUMERUS":    "OMERO",
+    "RADIUS":     "RADIO",
+    "ULNA":       "ULNA",
+    "CLAVICLE":   "CLAVICOLA",
+    "SCAPULA":    "SCAPOLA",
+    "SPINE":      "COLONNA",
+    "FOREARM":    "AVAMBRACCIO",
+    "LEG":        "GAMBA",
+    "ARM":        "BRACCIO",
+    "NECK":       "COLLO",
+    "CALCANEUS":  "CALCAGNO",
+    "PATELLA":    "ROTULA",
+    "STERNUM":    "STERNO",
+    "MANDIBLE":   "MANDIBOLA",
+    "JAW":        "MANDIBOLA",
+    "SACRUM":     "SACRO",
+    "COCCYX":     "COCCIGE",
+    "THIGH":      "COSCIA",
+    "ORBIT":      "ORBITA",
+}
+
+# Projection abbreviations (kept as-is, not translated)
+_PROJECTIONS = {"AP", "PA", "LAT", "LL", "RL", "OBL", "AX", "AXIAL",
+                "OBLIQUE", "LATERAL", "TANGENTIAL", "SKYLINE"}
+
+# Scanner processing / positioning words to strip from exam descriptions
+_STRIP_WORDS = {"ORTO", "ORTHO", "CLINO", "ERECT", "SUPINE", "PRONE",
+                "GRID", "TABLE", "WALL", "BUCKY", "UPRIGHT",
+                "STANDING", "RECUMBENT", "DECUBITUS"}
+
 
 # ─────────────────────────────────────────────────────────────────
 # HELPERS
@@ -60,6 +132,45 @@ def _tag(ds, *tags, default="") -> str:
         except (KeyError, AttributeError, TypeError):
             pass
     return default
+
+
+def _clean_description(raw: str) -> str:
+    """
+    Clean scanner descriptions like 'FOOT/FOOT AP/STYLE_M':
+      1. Split on '/' and discard STYLE_* / processing segments
+      2. Pick the most descriptive segment (prefers body-part + projection)
+      3. Translate English body parts to Italian
+    Already-Italian values pass through unchanged.
+    """
+    segments = [s.strip() for s in raw.split("/") if s.strip()]
+
+    # Drop processing-style segments
+    segments = [s for s in segments
+                if not re.match(r"^(STYLE|PROC|MENU|MODE|FILTER)[_\s\-]", s)]
+
+    if not segments:
+        return raw
+
+    # Prefer the segment that includes a projection and a body part
+    best = segments[0]
+    for s in segments:
+        words = s.split()
+        if len(words) > 1 and any(w in _PROJECTIONS for w in words):
+            best = s
+            break
+
+    # Translate English body parts → Italian (longest phrases first)
+    result = best
+    for en, it in sorted(_BODY_PART_IT.items(), key=lambda x: -len(x[0])):
+        result = re.sub(r"\b" + re.escape(en) + r"\b", it, result)
+
+    # Strip scanner positioning / processing junk words
+    result = " ".join(w for w in result.split() if w not in _STRIP_WORDS)
+
+    # Normalise projection: LAT → LL
+    result = re.sub(r"\bLAT\b", "LL", result)
+
+    return result
 
 
 def _build_tipo(ds, fallback_path: Path) -> str:
@@ -81,9 +192,9 @@ def _build_tipo(ds, fallback_path: Path) -> str:
       - Prepends 'RX ' if the value doesn't already start with 'RX'
       - Returns '' if nothing found
     """
-    # Skip SR / annotation objects – they have their own description
+    # Skip all Structured Report / annotation objects (UIDs under ...1.1.88.*)
     sop = _tag(ds, (0x0008, 0x0016))
-    if "88.11.1" in sop or "88.67" in sop or "88.59" in sop:
+    if ".1.1.88." in sop:
         return ""
 
     raw = _tag(ds,
@@ -113,8 +224,10 @@ def _build_tipo(ds, fallback_path: Path) -> str:
     raw = re.sub(r"^\d+[-_\s]+", "", raw).strip()
     # Upper-case for consistency
     raw = raw.upper()
+    # Clean scanner descriptions and translate body parts to Italian
+    raw = _clean_description(raw)
     # Prepend 'RX ' if missing
-    if not raw.startswith("RX"):
+    if not re.match(r"^RX\b", raw):
         raw = "RX " + raw
 
     return raw
@@ -136,7 +249,7 @@ def age_to_category(age: Optional[int]) -> Dict[str, str]:
     cols = {"0 - 1": "", "1 - 16": "", "16 - 60": "", "> 60": ""}
     if age is None:
         return cols
-    if   age <= 1:  cols["0 - 1"]   = "X"
+    if   age < 1:   cols["0 - 1"]   = "X"
     elif age <= 16: cols["1 - 16"]  = "X"
     elif age <= 60: cols["16 - 60"] = "X"
     else:           cols["> 60"]    = "X"
@@ -146,7 +259,7 @@ def age_to_category(age: Optional[int]) -> Dict[str, str]:
 def format_date(raw: str) -> str:
     raw = str(raw).strip()
     if len(raw) == 8 and raw.isdigit():
-        return f"{raw[6:8]}/{raw[4:6]}/{raw[2:4]}"
+        return f"{raw[6:8]}/{raw[4:6]}/{raw[0:4]}"
     return raw
 
 
@@ -238,6 +351,7 @@ def scan_folder(root: str) -> pd.DataFrame:
     study_tipo:     Dict[str, str]             = {}   # first non-empty tipo per study
     study_dose_raw: Dict[str, str]             = {}   # first non-empty raw dose per study
     scanned = skipped = 0
+    t0 = time.monotonic()
 
     for dirpath, _, files in os.walk(root):
         for fname in files:
@@ -286,8 +400,9 @@ def scan_folder(root: str) -> pd.DataFrame:
                 print(f"  … {scanned} files, {len(study_files)} studies, "
                       f"{skipped} non-X-ray skipped", flush=True)
 
+    elapsed = time.monotonic() - t0
     print(f"\n  Scan done: {scanned} files | {len(study_files)} studies "
-          f"| {skipped} non-X-ray skipped\n", flush=True)
+          f"| {skipped} non-X-ray skipped | {elapsed:.1f}s\n", flush=True)
 
     records: List[Dict] = []
     skipped_studies = 0
@@ -374,6 +489,91 @@ def _clean(v) -> Optional[str]:
     return s if s.strip() else None
 
 
+def _add_summary_sheet(wb: Workbook, df: pd.DataFrame) -> None:
+    """Add a 'Riepilogo Mensile' sheet with exam-type counts by month."""
+    if "_sort_date" not in df.columns or "TIPO ESAME" not in df.columns:
+        return
+
+    month_label = df["_sort_date"].apply(
+        lambda x: f"{x[4:6]}/{x[0:4]}" if len(x) >= 6 else "??/????"
+    )
+    mask = df["TIPO ESAME"] != ""
+    if not mask.any():
+        return
+
+    ct = pd.crosstab(
+        df.loc[mask, "TIPO ESAME"],
+        month_label[mask],
+        margins=True,
+        margins_name="TOTALE",
+    )
+
+    # Sort month columns chronologically, TOTALE last
+    month_cols = sorted(
+        [c for c in ct.columns if c != "TOTALE"],
+        key=lambda x: x[3:7] + x[0:2],
+    )
+    col_order = month_cols + ["TOTALE"]
+    ct = ct[col_order]
+
+    # Sort rows by total descending, TOTALE row last
+    if "TOTALE" in ct.index:
+        total_row = ct.loc[["TOTALE"]]
+        ct_body = ct.drop("TOTALE").sort_values("TOTALE", ascending=False)
+        ct = pd.concat([ct_body, total_row])
+
+    ws = wb.create_sheet("Riepilogo Mensile")
+    BLUE, GREY, LIGHT_BLUE = "BDD7EE", "D9D9D9", "DAEEF3"
+    n_cols = 1 + len(col_order)
+
+    # Column widths
+    ws.column_dimensions["A"].width = max(22, max(len(str(i)) for i in ct.index) + 4)
+    for ci, col_name in enumerate(col_order, start=2):
+        ws.column_dimensions[get_column_letter(ci)].width = max(9, len(col_name) + 2)
+
+    # Row 1 – title
+    _hdr(ws, 1, 1, "RIEPILOGO MENSILE ESAMI", bg=BLUE, size=11)
+    if n_cols > 1:
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+    ws.row_dimensions[1].height = 22
+
+    # Row 2 – column headers
+    _hdr(ws, 2, 1, "TIPO ESAME", bg=GREY, size=9)
+    for ci, col_name in enumerate(col_order, start=2):
+        _hdr(ws, 2, ci, col_name, bg=GREY, size=9)
+    ws.row_dimensions[2].height = 18
+
+    # Data rows
+    for ri, idx in enumerate(ct.index):
+        xl_row = ri + 3
+        is_total = (idx == "TOTALE")
+        bg = LIGHT_BLUE if is_total else None
+        bold = is_total
+
+        cell = ws.cell(row=xl_row, column=1, value=str(idx))
+        cell.font      = Font(name="Arial", size=9, bold=bold)
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+        cell.border    = _ALL
+        if bg:
+            cell.fill = PatternFill("solid", start_color=bg)
+
+        for ci, col_name in enumerate(col_order, start=2):
+            val = int(ct.loc[idx, col_name])
+            cell = ws.cell(row=xl_row, column=ci, value=val if val else None)
+            cell.font      = Font(name="Arial", size=9, bold=bold)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border    = _ALL
+            if bg:
+                cell.fill = PatternFill("solid", start_color=bg)
+            # TOTALE row always shows values, data rows blank out zeroes
+            if is_total and val == 0:
+                cell.value = 0
+
+        ws.row_dimensions[xl_row].height = 15
+
+    ws.freeze_panes = "B3"
+
+
 def build_excel(df: pd.DataFrame, output_path: str) -> None:
     wb = Workbook()
     ws = wb.active
@@ -383,8 +583,8 @@ def build_excel(df: pd.DataFrame, output_path: str) -> None:
     C_A1, C_A2, C_A3, C_A4  = 3, 4, 5, 6
     C_DOSE                   = 7
 
-    for col, w in {C_DATE: 13, C_TYPE: 28, C_A1: 7, C_A2: 7,
-                   C_A3: 8, C_A4: 7, C_DOSE: 40}.items():
+    for col, w in {C_DATE: 14, C_TYPE: 28,
+                   C_A1: 7, C_A2: 7, C_A3: 8, C_A4: 7, C_DOSE: 40}.items():
         ws.column_dimensions[get_column_letter(col)].width = w
 
     BLUE, GREY = "BDD7EE", "D9D9D9"
@@ -425,7 +625,20 @@ def build_excel(df: pd.DataFrame, output_path: str) -> None:
 
     ws.freeze_panes = "A3"
     ws.auto_filter.ref = f"A2:{get_column_letter(C_DOSE)}{len(df) + 2}"
-    wb.save(output_path)
+
+    _add_summary_sheet(wb, df)
+
+    try:
+        wb.save(output_path)
+    except PermissionError:
+        print(f"❌  Cannot write '{output_path}' – file is open in another program.",
+              file=sys.stderr)
+        base, ext = os.path.splitext(output_path)
+        alt_path = f"{base}_{int(time.time())}{ext}"
+        wb.save(alt_path)
+        print(f"✅  Saved to alternate path → {alt_path}  ({len(df)} rows)")
+        return
+
     print(f"✅  Saved → {output_path}  ({len(df)} rows)")
 
 
@@ -433,14 +646,27 @@ def build_excel(df: pd.DataFrame, output_path: str) -> None:
 # YEAR FILTER
 # ─────────────────────────────────────────────────────────────────
 
-def prompt_year_filter(df: pd.DataFrame) -> pd.DataFrame:
+def prompt_year_filter(df: pd.DataFrame, cli_years: Optional[str] = None) -> pd.DataFrame:
     """
-    Inspect the _sort_date column to find available years, then prompt
-    the user to select which year(s) to export.  Returns the filtered
-    DataFrame (still containing _sort_date; caller is responsible for
-    dropping it).  If only one year is present the prompt is skipped.
+    Filter by year.  If *cli_years* is provided (from --year), use it
+    directly without prompting.  Otherwise prompt interactively.
     """
     years = sorted(df["_sort_date"].str[:4].unique().tolist())
+
+    # Non-interactive: --year flag
+    if cli_years:
+        tokens = [t.strip() for t in cli_years.split(",") if t.strip()]
+        invalid = [t for t in tokens if t not in years]
+        if invalid:
+            print(f"⚠️  Year(s) not in data: {', '.join(invalid)}. "
+                  f"Available: {', '.join(years)}", file=sys.stderr)
+            tokens = [t for t in tokens if t in years]
+        if not tokens:
+            print(f"  → No matching years. Exporting all {len(df)} studies.")
+            return df
+        filtered = df[df["_sort_date"].str[:4].isin(tokens)].reset_index(drop=True)
+        print(f"  → {len(filtered)} studies for year(s): {', '.join(tokens)}.")
+        return filtered
 
     if len(years) <= 1:
         return df
@@ -474,6 +700,96 @@ def prompt_year_filter(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────
+# SUMMARY STATISTICS
+# ─────────────────────────────────────────────────────────────────
+
+def print_summary(df: pd.DataFrame) -> None:
+    """Print a brief summary of the exported data."""
+    print(f"\n{'─'*50}")
+    print(f"  Summary: {len(df)} studies exported")
+    print(f"{'─'*50}")
+
+    has_dates = "_sort_date" in df.columns
+    has_tipos = "TIPO ESAME" in df.columns
+
+    # ── Monthly breakdown by exam type ───────────────────────────
+    if has_dates and has_tipos:
+        # Extract MM/YYYY from _sort_date (YYYYMMDD)
+        month_label = df["_sort_date"].apply(
+            lambda x: f"{x[4:6]}/{x[0:4]}" if len(x) >= 6 else "??/????"
+        )
+        mask = df["TIPO ESAME"] != ""
+        if mask.any():
+            ct = pd.crosstab(
+                df.loc[mask, "TIPO ESAME"],
+                month_label[mask],
+                margins=True,
+                margins_name="TOTALE",
+            )
+            # Sort month columns chronologically, TOTALE last
+            month_cols = sorted(
+                [c for c in ct.columns if c != "TOTALE"],
+                key=lambda x: x[3:7] + x[0:2],
+            )
+            ct = ct[month_cols + ["TOTALE"]]
+
+            # Sort rows by total descending, TOTALE row last
+            if "TOTALE" in ct.index:
+                total_row = ct.loc[["TOTALE"]]
+                ct_body = ct.drop("TOTALE").sort_values("TOTALE", ascending=False)
+                ct = pd.concat([ct_body, total_row])
+
+            # Column widths
+            tipo_w = max(20, max(len(str(i)) for i in ct.index) + 2)
+            col_w = max(7, max(len(c) for c in ct.columns) + 1)
+            sep = "    " + "─" * (tipo_w + (col_w + 1) * len(ct.columns))
+
+            print(f"\n  Exam count by month:\n")
+
+            # Header
+            hdr = f"    {'TIPO ESAME':<{tipo_w}}"
+            for c in ct.columns:
+                hdr += f" {c:>{col_w}}"
+            print(hdr)
+            print(sep)
+
+            # Data rows
+            for idx in ct.index:
+                if idx == "TOTALE":
+                    print(sep)
+                line = f"    {str(idx):<{tipo_w}}"
+                for c in ct.columns:
+                    line += f" {int(ct.loc[idx, c]):>{col_w}}"
+                print(line)
+
+            print()
+
+    elif has_tipos:
+        # Fallback when no date column is available
+        tipo_counts = df["TIPO ESAME"].replace("", pd.NA).dropna().value_counts()
+        if not tipo_counts.empty:
+            print("\n  Top exam types:")
+            for tipo, count in tipo_counts.head(10).items():
+                print(f"    {tipo:30s}  {count:>4d}")
+
+    # ── By age category ──────────────────────────────────────────
+    age_cols = ["0 - 1", "1 - 16", "16 - 60", "> 60"]
+    present = [c for c in age_cols if c in df.columns]
+    if present:
+        total_marked = 0
+        print("\n  By age group:")
+        for col in present:
+            count = (df[col] == "X").sum()
+            total_marked += count
+            print(f"    {col:30s}  {count:>4d}")
+        unknown = len(df) - total_marked
+        if unknown > 0:
+            print(f"    {'Unknown':30s}  {unknown:>4d}")
+
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────
 
@@ -483,6 +799,8 @@ def main():
     )
     ap.add_argument("folder", help="Root path of the OsiriX MD study folder")
     ap.add_argument("--output", "-o", default="Archivio_Esami_RX.xlsx")
+    ap.add_argument("--year", "-y", default=None, metavar="YYYY",
+                    help="Export only these year(s), comma-separated (e.g. 2024 or 2023,2024)")
     ap.add_argument("--debug", action="store_true",
                     help="Print tag values of first N files and exit")
     ap.add_argument("--debug-count", type=int, default=10, metavar="N")
@@ -504,8 +822,7 @@ def main():
         print("    Tip: run with --debug to inspect tag contents.")
         sys.exit(0)
 
-    df = prompt_year_filter(df)
-    df.drop(columns=["_sort_date"], inplace=True)
+    df = prompt_year_filter(df, cli_years=args.year)
 
     if df.empty:
         print("⚠️  No studies remaining after year filter.")
@@ -513,6 +830,7 @@ def main():
 
     print("📊  Building Excel file …")
     build_excel(df, args.output)
+    print_summary(df)
 
 
 if __name__ == "__main__":
